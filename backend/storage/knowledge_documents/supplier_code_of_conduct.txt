@@ -1,0 +1,6 @@
+SUPPLIER CODE OF CONDUCT AND ON-TIME PERFORMANCE STANDARDS
+
+Section 1: Supplier Compliance
+1.1 Suppliers must maintain an on-time delivery reliability score of at least 85% to retain Preferred status.
+1.2 Defect rates exceeding 3% will result in a Needs Attention badge and mandatory performance review.
+1.3 Invoices must match PO line items and unit rates exactly.

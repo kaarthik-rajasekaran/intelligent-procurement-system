@@ -1,0 +1,16 @@
+ENTERPRISE PROCUREMENT POLICY AND THRESHOLD GOVERNANCE
+
+Section 1: Approval Matrix
+1.1 Purchases under $5,000 require Department Supervisor approval.
+1.2 Purchases between $5,000 and $50,000 require multi-vendor RFQ bidding with at least two qualified quotations.
+1.3 Purchases exceeding $50,000 require Finance Director review.
+
+Section 2: Vendor Selection Guidelines
+2.1 The lowest quote is not automatically awarded. Evaluators must balance unit cost (40%), lead time (20%), delivery reliability (20%), and vendor quality (20%).
+2.2 If an evaluator overrides the system-recommended vendor, a mandatory documented business rationale must be entered.
+2.3 High-reliability vendors with certified quality badges should be favored for mission-critical IT infrastructure.
+
+Section 3: Purchase Orders and Payment Terms
+3.1 No procurement commitments may be made without an officially generated Purchase Order (PO).
+3.2 PO generation is idempotent and requires prerequisite supervisor final approval.
+3.3 Net 30 payment terms apply to all certified vendor fulfillment orders.
