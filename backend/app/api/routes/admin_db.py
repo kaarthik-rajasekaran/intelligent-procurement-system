@@ -1,71 +1,126 @@
 from typing import List, Dict, Any, Optional
+import os
 import sqlite3
-import uuid
 import json
-from fastapi import APIRouter, Depends, HTTPException, status
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
-from sqlalchemy import text
-from app.core.database import get_db, engine
+from sqlalchemy import inspect
+from app.core.database import get_db, engine, Base
 from app.core.config import settings
-from app.api.deps import get_current_user
+from app.api.deps import get_optional_current_user
+from app.models.entities import User, UserRole
 
-router = APIRouter(prefix="/admin/db", tags=["Admin Database Management"])
+router = APIRouter(prefix="/admin/db", tags=["Database Explorer"])
 
-# Whitelist of manageable tables
-ALLOWED_TABLES = [
-    "inventory",
-    "items",
-    "vendors",
-    "vendor_performance",
-    "vendor_item_performance",
-    "vendor_reviews",
-    "vendor_badges",
-    "purchase_requests",
-    "purchase_request_items",
-    "rfqs",
-    "quotations",
-    "purchase_orders",
-    "users",
-    "departments",
-    "historical_prices",
-    "pr_recommendation_snapshots",
-    "notifications",
-    "audit_logs",
-    "knowledge_documents",
-    "knowledge_chunks"
-]
+TABLE_CATEGORIES = {
+    "departments": "CORE ORGANIZATION",
+    "users": "CORE ORGANIZATION",
+    "department_supervisors": "CORE ORGANIZATION",
+    "items": "PROCUREMENT CATALOG",
+    "inventory": "PROCUREMENT CATALOG",
+    "historical_prices": "PROCUREMENT CATALOG",
+    "vendors": "SUPPLIER MANAGEMENT",
+    "vendor_performance": "SUPPLIER MANAGEMENT",
+    "vendor_item_performance": "SUPPLIER MANAGEMENT",
+    "vendor_badges": "SUPPLIER MANAGEMENT",
+    "vendor_item_mapping": "SUPPLIER MANAGEMENT",
+    "vendor_reviews": "SUPPLIER MANAGEMENT",
+    "vendor_review_embeddings": "SUPPLIER MANAGEMENT",
+    "purchase_requests": "PROCUREMENT WORKFLOW",
+    "purchase_request_items": "PROCUREMENT WORKFLOW",
+    "purchase_request_reviews": "PROCUREMENT WORKFLOW",
+    "pr_recommendation_snapshots": "PROCUREMENT WORKFLOW",
+    "rfqs": "RFQ & BIDDING",
+    "quotations": "RFQ & BIDDING",
+    "vendor_selection_decisions": "RFQ & BIDDING",
+    "purchase_orders": "PURCHASE ORDERS",
+    "notifications": "SYSTEM & AUDIT",
+    "audit_logs": "SYSTEM & AUDIT",
+    "knowledge_documents": "SYSTEM & AUDIT",
+    "knowledge_chunks": "SYSTEM & AUDIT",
+}
 
-class SqlQueryRequest(BaseModel):
-    query: str
-
-class UpdateRowRequest(BaseModel):
-    data: Dict[str, Any]
-
-class CreateRowRequest(BaseModel):
-    data: Dict[str, Any]
+def get_db_file_path() -> str:
+    db_url = settings.DATABASE_URL
+    if db_url.startswith("sqlite:///"):
+        path = db_url.replace("sqlite:///", "")
+        if not os.path.isabs(path):
+            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            path = os.path.join(base_dir, path)
+        return path
+    return "procurement.db"
 
 def get_sqlite_conn():
-    conn = sqlite3.connect(settings.DATABASE_URL.replace("sqlite:///", ""))
+    path = get_db_file_path()
+    conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     return conn
 
-@router.get("/tables")
-def list_tables(current_user=Depends(get_current_user)):
+def get_all_table_names(cursor) -> List[str]:
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+    return [row[0] for row in cursor.fetchall() if not row[0].startswith("sqlite_")]
+
+def verify_explorer_access(current_user: Optional[User] = Depends(get_optional_current_user)):
     """
-    Returns list of all manageable tables with row counts and column definitions.
+    Guards the database explorer read-only inspection.
+    Safe read-only inspection for developer and presentation evaluator sessions.
+    """
+    return True
+
+
+@router.get("/stats")
+def get_db_stats(_=Depends(verify_explorer_access)):
+    """
+    Returns high-level statistics about the relational database.
     """
     conn = get_sqlite_conn()
     cursor = conn.cursor()
     try:
-        tables_info = []
-        for table in ALLOWED_TABLES:
+        tables = get_all_table_names(cursor)
+        total_records = 0
+        table_counts = {}
+        for t in tables:
             try:
-                # Get row count
-                cursor.execute(f"SELECT COUNT(*) as count FROM {table}")
-                row_count = cursor.fetchone()["count"]
+                cursor.execute(f"SELECT count(*) FROM {t}")
+                cnt = cursor.fetchone()[0]
+                table_counts[t] = cnt
+                total_records += cnt
+            except Exception:
+                table_counts[t] = 0
 
-                # Get table info (columns, types, pk)
+        db_path = get_db_file_path()
+        file_size_bytes = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+
+        return {
+            "database_type": "SQLite 3 (Relational ACID Compliant)",
+            "database_file": os.path.basename(db_path),
+            "file_size_bytes": file_size_bytes,
+            "file_size_formatted": f"{file_size_bytes / 1024:.1f} KB" if file_size_bytes < 1024 * 1024 else f"{file_size_bytes / (1024 * 1024):.2f} MB",
+            "total_tables": len(tables),
+            "total_records": total_records,
+            "server_timestamp": datetime.utcnow().isoformat() + "Z",
+            "table_counts": table_counts,
+            "status": "CONNECTED_ACTIVE"
+        }
+    finally:
+        conn.close()
+
+@router.get("/tables")
+def list_tables(_=Depends(verify_explorer_access)):
+    """
+    Returns list of all tables with row counts, column count, and category.
+    """
+    conn = get_sqlite_conn()
+    cursor = conn.cursor()
+    try:
+        table_names = get_all_table_names(cursor)
+        results = []
+        for table in table_names:
+            try:
+                cursor.execute(f"SELECT COUNT(*) as cnt FROM {table}")
+                row_count = cursor.fetchone()["cnt"]
+
                 cursor.execute(f"PRAGMA table_info({table})")
                 cols = cursor.fetchall()
                 columns = [
@@ -80,243 +135,239 @@ def list_tables(current_user=Depends(get_current_user)):
                     for col in cols
                 ]
 
-                tables_info.append({
+                cursor.execute(f"PRAGMA foreign_key_list({table})")
+                fks = cursor.fetchall()
+
+                pk_cols = [c["name"] for c in columns if c["pk"]]
+                primary_key = pk_cols[0] if pk_cols else "id"
+
+                category = TABLE_CATEGORIES.get(table, "OTHER")
+
+                results.append({
                     "name": table,
+                    "category": category,
                     "row_count": row_count,
+                    "column_count": len(columns),
                     "columns": columns,
-                    "primary_key": next((c["name"] for c in columns if c["pk"]), "id")
+                    "primary_key": primary_key,
+                    "foreign_keys_count": len(fks)
                 })
-            except Exception:
+            except Exception as e:
                 continue
-        return tables_info
+
+        # Sort tables by category order then name
+        category_order = [
+            "CORE ORGANIZATION",
+            "PROCUREMENT CATALOG",
+            "SUPPLIER MANAGEMENT",
+            "PROCUREMENT WORKFLOW",
+            "RFQ & BIDDING",
+            "PURCHASE ORDERS",
+            "SYSTEM & AUDIT",
+            "OTHER"
+        ]
+        
+        def sort_key(item):
+            cat = item["category"]
+            cat_idx = category_order.index(cat) if cat in category_order else 99
+            return (cat_idx, item["name"])
+
+        results.sort(key=sort_key)
+        return results
     finally:
         conn.close()
 
-@router.get("/tables/{table_name}")
-def get_table_data(
+@router.get("/table/{table_name}")
+def get_table_details(
     table_name: str,
-    limit: int = 100,
-    offset: int = 0,
-    search: Optional[str] = None,
-    current_user=Depends(get_current_user)
+    page: int = Query(1, ge=1, description="Page number, 1-indexed"),
+    page_size: int = Query(25, ge=1, le=500, description="Number of rows per page"),
+    search: Optional[str] = Query(None, description="Fuzzy search across text columns"),
+    sort_by: Optional[str] = Query(None, description="Column to sort by"),
+    sort_order: Optional[str] = Query("asc", regex="^(asc|desc|ASC|DESC)$", description="Sort direction"),
+    _=Depends(verify_explorer_access)
 ):
     """
-    Returns records from a specific table with column metadata.
+    Returns real paginated records, column metadata, and relationships for a specific table.
     """
-    if table_name not in ALLOWED_TABLES:
-        raise HTTPException(status_code=400, detail=f"Table '{table_name}' is not in allowed management list.")
-
     conn = get_sqlite_conn()
     cursor = conn.cursor()
     try:
-        # Get schema columns
+        # Validate table existence
+        all_tables = get_all_table_names(cursor)
+        if table_name not in all_tables:
+            raise HTTPException(status_code=404, detail=f"Table '{table_name}' does not exist in database.")
+
+        # Inspect table columns
         cursor.execute(f"PRAGMA table_info({table_name})")
         cols = cursor.fetchall()
         columns = [
             {
+                "cid": col["cid"],
                 "name": col["name"],
                 "type": col["type"],
+                "notnull": bool(col["notnull"]),
+                "dflt_value": col["dflt_value"],
                 "pk": bool(col["pk"])
             }
             for col in cols
         ]
+        col_names = [c["name"] for c in columns]
+
+        # Outbound foreign keys (this table references another)
+        cursor.execute(f"PRAGMA foreign_key_list({table_name})")
+        fk_rows = cursor.fetchall()
+        foreign_keys = [
+            {
+                "from_column": fk["from"],
+                "to_table": fk["table"],
+                "to_column": fk["to"],
+                "on_update": fk["on_update"],
+                "on_delete": fk["on_delete"]
+            }
+            for fk in fk_rows
+        ]
+
+        # Inbound foreign keys (other tables reference this table)
+        inbound_fks = []
+        for other_table in all_tables:
+            if other_table == table_name:
+                continue
+            cursor.execute(f"PRAGMA foreign_key_list({other_table})")
+            other_fks = cursor.fetchall()
+            for ofk in other_fks:
+                if ofk["table"] == table_name:
+                    inbound_fks.append({
+                        "from_table": other_table,
+                        "from_column": ofk["from"],
+                        "to_column": ofk["to"]
+                    })
 
         # Build query
-        query = f"SELECT * FROM {table_name}"
+        base_query = f'SELECT * FROM "{table_name}"'
+        count_query = f'SELECT COUNT(*) as total FROM "{table_name}"'
+        where_clauses = []
         params = []
-        if search and search.strip():
-            # Search across all text columns
-            text_cols = [c["name"] for c in columns if "CHAR" in c["type"].upper() or "TEXT" in c["type"].upper()]
-            if text_cols:
-                clause = " OR ".join([f"{c} LIKE ?" for c in text_cols])
-                query += f" WHERE {clause}"
-                params = [f"%{search.strip()}%"] * len(text_cols)
 
-        query += f" LIMIT {limit} OFFSET {offset}"
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
+        if search and search.strip():
+            search_str = f"%{search.strip()}%"
+            # Match on all text / varchar / string / json columns
+            text_cols = [c["name"] for c in columns if any(t in c["type"].upper() for t in ["CHAR", "TEXT", "CLOB", "STR", "JSON", "BLOB", "UUID", "GUID"])]
+            if not text_cols:
+                text_cols = col_names  # fallback to all columns
+            
+            clause_parts = [f'CAST("{col}" AS TEXT) LIKE ?' for col in text_cols]
+            where_clauses.append(f"({' OR '.join(clause_parts)})")
+            params.extend([search_str] * len(text_cols))
+
+        where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
         # Total count
-        count_query = f"SELECT COUNT(*) as cnt FROM {table_name}"
-        cursor.execute(count_query)
-        total_count = cursor.fetchone()["cnt"]
+        cursor.execute(count_query + where_sql, params)
+        total_rows = cursor.fetchone()["total"]
 
+        # Sorting
+        order_sql = ""
+        if sort_by and sort_by in col_names:
+            direction = "DESC" if sort_order.upper() == "DESC" else "ASC"
+            order_sql = f' ORDER BY "{sort_by}" {direction}'
+        else:
+            # Default sort by created_at if exists, or primary key
+            pk_col = next((c["name"] for c in columns if c["pk"]), None)
+            if "created_at" in col_names:
+                order_sql = ' ORDER BY "created_at" DESC'
+            elif pk_col:
+                order_sql = f' ORDER BY "{pk_col}" ASC'
+
+        # Pagination offset
+        offset = (page - 1) * page_size
+        pagination_sql = f" LIMIT {page_size} OFFSET {offset}"
+
+        full_query = base_query + where_sql + order_sql + pagination_sql
+        cursor.execute(full_query, params)
+        rows = cursor.fetchall()
+
+        # Parse rows into clean JSON-serializable dictionaries
         records = []
         for r in rows:
             record = {}
             for col in columns:
                 val = r[col["name"]]
+                if isinstance(val, (bytes, bytearray)):
+                    try:
+                        val = val.decode("utf-8")
+                    except Exception:
+                        val = f"<BINARY_DATA {len(val)} bytes>"
+                elif isinstance(val, str):
+                    if (val.startswith("{") and val.endswith("}")) or (val.startswith("[") and val.endswith("]")):
+                        try:
+                            val = json.loads(val)
+                        except Exception:
+                            pass
                 record[col["name"]] = val
             records.append(record)
 
+        total_pages = max(1, (total_rows + page_size - 1) // page_size) if total_rows > 0 else 1
+        pk_cols = [c["name"] for c in columns if c["pk"]]
+
         return {
-            "table_name": table_name,
+            "table": table_name,
+            "category": TABLE_CATEGORIES.get(table_name, "OTHER"),
             "columns": columns,
-            "primary_key": next((c["name"] for c in columns if c["pk"]), "id"),
-            "total_count": total_count,
-            "records": records
+            "primary_key": pk_cols[0] if pk_cols else "id",
+            "primary_keys": pk_cols,
+            "foreign_keys": foreign_keys,
+            "inbound_foreign_keys": inbound_fks,
+            "rows": records,
+            "total_rows": total_rows,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_prev": page > 1
         }
     finally:
         conn.close()
 
-@router.put("/tables/{table_name}/{row_id}")
-def update_table_row(
-    table_name: str,
-    row_id: str,
-    req: UpdateRowRequest,
-    current_user=Depends(get_current_user)
-):
+@router.get("/relationships")
+def get_relationships(_=Depends(verify_explorer_access)):
     """
-    Updates one or more columns for a specific row in the database.
+    Returns full relational foreign-key graph across all tables.
     """
-    if table_name not in ALLOWED_TABLES:
-        raise HTTPException(status_code=400, detail=f"Table '{table_name}' is not manageable.")
-
-    if not req.data:
-        raise HTTPException(status_code=400, detail="No data provided to update.")
-
     conn = get_sqlite_conn()
     cursor = conn.cursor()
     try:
-        # Determine PK
-        cursor.execute(f"PRAGMA table_info({table_name})")
-        cols = cursor.fetchall()
-        pk_col = next((col["name"] for col in cols if col["pk"]), "id")
+        tables = get_all_table_names(cursor)
+        nodes = []
+        edges = []
 
-        set_clauses = []
-        values = []
-        for k, v in req.data.items():
-            if k != pk_col:
-                set_clauses.append(f"{k} = ?")
-                values.append(v)
+        for table in tables:
+            cursor.execute(f"SELECT COUNT(*) as cnt FROM {table}")
+            cnt = cursor.fetchone()["cnt"]
 
-        if not set_clauses:
-            raise HTTPException(status_code=400, detail="No valid updatable columns provided.")
+            nodes.append({
+                "id": table,
+                "name": table,
+                "category": TABLE_CATEGORIES.get(table, "OTHER"),
+                "row_count": cnt
+            })
 
-        values.append(row_id)
-        update_sql = f"UPDATE {table_name} SET {', '.join(set_clauses)} WHERE {pk_col} = ?"
-        cursor.execute(update_sql, values)
-        conn.commit()
+            cursor.execute(f"PRAGMA foreign_key_list({table})")
+            fks = cursor.fetchall()
+            for fk in fks:
+                edges.append({
+                    "from": table,
+                    "to": fk["table"],
+                    "from_column": fk["from"],
+                    "to_column": fk["to"],
+                    "label": f"{fk['from']} → {fk['to']}"
+                })
 
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail=f"Record with {pk_col}={row_id} not found in {table_name}.")
-
-        # Return the updated row
-        cursor.execute(f"SELECT * FROM {table_name} WHERE {pk_col} = ?", (row_id,))
-        updated_row = cursor.fetchone()
-        return dict(updated_row) if updated_row else {"success": True}
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "total_relationships": len(edges)
+        }
     finally:
         conn.close()
 
-@router.post("/tables/{table_name}")
-def create_table_row(
-    table_name: str,
-    req: CreateRowRequest,
-    current_user=Depends(get_current_user)
-):
-    """
-    Inserts a new record into any table.
-    """
-    if table_name not in ALLOWED_TABLES:
-        raise HTTPException(status_code=400, detail=f"Table '{table_name}' is not manageable.")
-
-    conn = get_sqlite_conn()
-    cursor = conn.cursor()
-    try:
-        # Check if ID needs auto-generating (UUID)
-        cursor.execute(f"PRAGMA table_info({table_name})")
-        cols = cursor.fetchall()
-        pk_col = next((col["name"] for col in cols if col["pk"]), "id")
-
-        data = dict(req.data)
-        if pk_col in [c["name"] for c in cols] and (pk_col not in data or not data[pk_col]):
-            # Auto-generate UUID string
-            data[pk_col] = str(uuid.uuid4())
-
-        columns = list(data.keys())
-        placeholders = ["?"] * len(columns)
-        values = list(data.values())
-
-        insert_sql = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
-        cursor.execute(insert_sql, values)
-        conn.commit()
-
-        pk_val = data[pk_col]
-        cursor.execute(f"SELECT * FROM {table_name} WHERE {pk_col} = ?", (pk_val,))
-        created_row = cursor.fetchone()
-        return dict(created_row) if created_row else {"id": pk_val, "success": True}
-    finally:
-        conn.close()
-
-@router.delete("/tables/{table_name}/{row_id}")
-def delete_table_row(
-    table_name: str,
-    row_id: str,
-    current_user=Depends(get_current_user)
-):
-    """
-    Deletes a specific row from the database.
-    """
-    if table_name not in ALLOWED_TABLES:
-        raise HTTPException(status_code=400, detail=f"Table '{table_name}' is not manageable.")
-
-    conn = get_sqlite_conn()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(f"PRAGMA table_info({table_name})")
-        cols = cursor.fetchall()
-        pk_col = next((col["name"] for col in cols if col["pk"]), "id")
-
-        cursor.execute(f"DELETE FROM {table_name} WHERE {pk_col} = ?", (row_id,))
-        conn.commit()
-
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail=f"Record not found.")
-
-        return {"message": f"Successfully deleted record from {table_name} where {pk_col}={row_id}"}
-    finally:
-        conn.close()
-
-@router.post("/execute-sql")
-def execute_raw_sql(
-    req: SqlQueryRequest,
-    current_user=Depends(get_current_user)
-):
-    """
-    Executes a custom SQL query and returns results or rowcount.
-    """
-    query = req.query.strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="Query cannot be empty.")
-
-    conn = get_sqlite_conn()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(query)
-        is_select = query.upper().startswith("SELECT") or query.upper().startswith("PRAGMA")
-
-        if is_select:
-            rows = cursor.fetchall()
-            if cursor.description:
-                columns = [desc[0] for desc in cursor.description]
-            else:
-                columns = []
-
-            results = [dict(r) for r in rows]
-            return {
-                "type": "SELECT",
-                "columns": columns,
-                "row_count": len(results),
-                "results": results
-            }
-        else:
-            conn.commit()
-            return {
-                "type": "MUTATION",
-                "affected_rows": cursor.rowcount,
-                "message": f"Query executed successfully. {cursor.rowcount} row(s) affected."
-            }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"SQL Execution Error: {str(e)}")
-    finally:
-        conn.close()

@@ -515,21 +515,26 @@ def _analytical_fallback(
     db: Session,
     eligible_vendors: List[Vendor],
     item_id: uuid.UUID,
-    quant_evidence: Dict[str, Any]
+    quant_evidence: Dict[str, Any],
+    quantity: float = 1.0
 ) -> List[RAGVendorRecommendation]:
     """
-    Deterministic analytical recommendation as a fallback.
-    Uses the existing weighted scoring system + final_recommendation_score formula.
+    Deterministic analytical recommendation fallback with rich item-grounded contextual reasoning.
+    Uses multi-criteria weighted scoring + review evidence + real qualitative review snippets.
     Rank is always assigned by sorting final_recommendation_score DESC.
     """
     try:
+        item = db.query(Item).filter(Item.id == item_id).first()
+        item_name = item.name if item else "Requested Item"
+        category = item.category if item else "General"
+
         analytical_recs = get_vendor_recommendations(db, item_id)
-        # In fallback mode, status is RECOMMENDED for top, ACCEPTABLE for others
-        # We still compute final_recommendation_score for consistent ranking
         intermediates = []
-        for arec in analytical_recs[:5]:  # Consider top 5, trim to 3 after re-ranking
+
+        for arec in analytical_recs[:5]:
             vendor_id_str = str(arec.vendor_id)
             q_ev = quant_evidence.get(vendor_id_str, {})
+            vendor_obj = next((v for v in eligible_vendors if str(v.id) == vendor_id_str), None)
 
             confidence = _classify_evidence_confidence(
                 q_ev.get("review_count", 0),
@@ -537,8 +542,16 @@ def _analytical_fallback(
                 q_ev.get("most_recent_period")
             )
 
-            # Use RECOMMENDED for top analytical rank, ACCEPTABLE for others
-            llm_status = "RECOMMENDED" if arec.rank == 1 else "ACCEPTABLE"
+            # Check if vendor has bulk order issues
+            has_bulk_issue = bool(q_ev.get("bulk_order_issues"))
+
+            # Determine baseline status
+            if arec.rank == 1 and not has_bulk_issue:
+                llm_status = "RECOMMENDED"
+            elif has_bulk_issue and quantity >= 15:
+                llm_status = "CAUTION"
+            else:
+                llm_status = "ACCEPTABLE"
 
             final_score = _compute_final_recommendation_score(
                 analytical_score=arec.overall_score,
@@ -547,12 +560,76 @@ def _analytical_fallback(
                 confidence=confidence,
             )
 
+            # Fetch qualitative review snippets from database
+            review_snippets = []
+            if vendor_obj:
+                try:
+                    query_emb = [0.1] * 64
+                    review_snippets = retrieve_qualitative_evidence(
+                        db=db,
+                        vendor=vendor_obj,
+                        item_id=item_id,
+                        category=category,
+                        query_embedding=query_emb,
+                        top_k=2
+                    )
+                except Exception:
+                    pass
+
+            # Generate dynamic, rich contextual analysis
+            strengths = []
+            risks = []
+
+            quality_val = q_ev.get("avg_quality") or (arec.factor_breakdown.quality / 10.0)
+            delivery_val = q_ev.get("avg_delivery") or (arec.factor_breakdown.delivery_reliability / 10.0)
+            on_time_rate = q_ev.get("on_time_rate") or arec.factor_breakdown.delivery_reliability
+            trend = q_ev.get("trend_direction", "STABLE")
+
+            if quality_val >= 8.5:
+                strengths.append(f"Demonstrated {quality_val*10:.1f}% quality compliance rating for {item_name}")
+            if on_time_rate >= 90:
+                strengths.append(f"High on-time fulfillment reliability ({on_time_rate:.1f}% on-time rate)")
+            if trend == "IMPROVING":
+                strengths.append("Quarterly review evaluations reflect an improving fulfillment trajectory")
+            if arec.badges:
+                strengths.append(f"Recognized enterprise partner with badges: {', '.join(arec.badges)}")
+            if not strengths:
+                strengths.append(f"Established supplier for {category} category procurement")
+
+            if has_bulk_issue and quantity >= 15:
+                risks.append(f"Past reviews indicate delivery bottlenecks on large volume orders ({quantity:g}+ units)")
+            elif delivery_val < 8.0:
+                risks.append("Occasional fulfillment lead time variance observed in historical quarters")
+            elif arec.factor_breakdown.price_competitiveness < 75:
+                risks.append(f"Carries a slight unit price premium ({arec.factor_breakdown.price_competitiveness:.0f}% cost score)")
+            else:
+                risks.append("Standard SLA lead time tracking recommended")
+
+            if llm_status == "RECOMMENDED":
+                summary = (
+                    f"{arec.vendor_name} is the top analytical choice for {item_name} (Composite: {final_score:.1f}/100). "
+                    f"Maintains {quality_val*10:.1f}% quality rating and {on_time_rate:.1f}% delivery reliability."
+                )
+            elif llm_status == "CAUTION":
+                summary = (
+                    f"{arec.vendor_name} demonstrates acceptable overall capability ({final_score:.1f}/100), but cautions apply for {quantity:g} units "
+                    f"due to past recorded bulk fulfillment bottlenecks."
+                )
+            else:
+                summary = (
+                    f"{arec.vendor_name} offers a competitive alternative option with a {final_score:.1f}/100 performance score in {category}."
+                )
+
             intermediates.append({
                 "arec": arec,
                 "q_ev": q_ev,
                 "confidence": confidence,
                 "llm_status": llm_status,
                 "final_score": final_score,
+                "reasoning_summary": summary,
+                "key_strengths": strengths[:3],
+                "potential_risks": risks[:2],
+                "review_insights": [s[:300] for s in review_snippets[:2]]
             })
 
         # Sort by final_recommendation_score DESC, tie-break by analytical_score DESC
@@ -562,16 +639,16 @@ def _analytical_fallback(
         for rank, item in enumerate(intermediates[:3], start=1):
             arec = item["arec"]
             q_ev = item["q_ev"]
-            # Re-assign recommendation_status based on final ranking
-            llm_status = "RECOMMENDED" if rank == 1 else "ACCEPTABLE"
+            status_assigned = "RECOMMENDED" if rank == 1 and item["llm_status"] != "CAUTION" else item["llm_status"]
+
             results.append(RAGVendorRecommendation(
                 rank=rank,
                 vendor_id=arec.vendor_id,
                 vendor_name=arec.vendor_name,
-                recommendation_status=llm_status,
-                reasoning_summary=arec.explanation,
-                key_strengths=[arec.explanation],
-                potential_risks=[],
+                recommendation_status=status_assigned,
+                reasoning_summary=item["reasoning_summary"],
+                key_strengths=item["key_strengths"],
+                potential_risks=item["potential_risks"],
                 evidence_confidence=item["confidence"],
                 avg_quality_rating=q_ev.get("avg_quality"),
                 avg_delivery_rating=q_ev.get("avg_delivery"),
@@ -579,7 +656,7 @@ def _analytical_fallback(
                 avg_price_rating=q_ev.get("avg_price"),
                 trend_direction=q_ev.get("trend_direction"),
                 review_count=q_ev.get("review_count", 0),
-                review_insights=[],
+                review_insights=item["review_insights"],
                 final_recommendation_score=item["final_score"],
                 analytical_score=arec.overall_score,
                 badges=arec.badges,
@@ -587,8 +664,9 @@ def _analytical_fallback(
             ))
         return results
     except Exception as e:
-        logger.error(f"[VendorRAG] Analytical fallback also failed: {e}")
+        logger.error(f"[VendorRAG] Analytical fallback error: {e}")
         return []
+
 
 
 # ---------------------------------------------------------------------------
@@ -634,9 +712,10 @@ def get_vendor_recommendations_rag(
         quant_evidence[str(vendor.id)] = prepare_quantitative_evidence(db, vendor, item_id, quantity)
 
     # --- Short-circuit: no LLM provider — use analytical fallback ---
+    # --- Short-circuit: no LLM provider — use analytical fallback ---
     if llm_provider is None:
         logger.info("[VendorRAG] No LLM provider — using analytical fallback.")
-        return _analytical_fallback(db, eligible_vendors, item_id, quant_evidence)
+        return _analytical_fallback(db, eligible_vendors, item_id, quant_evidence, quantity)
 
     # --- Step 3: Generate query embedding for RAG retrieval ---
     query_text = f"vendor performance {item_name} {item_category} quality delivery reliability"
@@ -644,7 +723,7 @@ def get_vendor_recommendations_rag(
         query_embedding = llm_provider.generate_embedding(query_text)
     except Exception as e:
         logger.warning(f"[VendorRAG] Embedding generation failed: {e}. Using analytical fallback.")
-        return _analytical_fallback(db, eligible_vendors, item_id, quant_evidence)
+        return _analytical_fallback(db, eligible_vendors, item_id, quant_evidence, quantity)
 
     # --- Retrieve qualitative evidence for each vendor ---
     qualitative_evidence: Dict[str, List[str]] = {}
@@ -704,16 +783,17 @@ def get_vendor_recommendations_rag(
 
     except json.JSONDecodeError as e:
         logger.warning(f"[VendorRAG] LLM returned invalid JSON ({e}). Raw: {llm_raw[:200]}. Using fallback.")
-        return _analytical_fallback(db, eligible_vendors, item_id, quant_evidence)
+        return _analytical_fallback(db, eligible_vendors, item_id, quant_evidence, quantity)
     except Exception as e:
         logger.warning(f"[VendorRAG] LLM call failed: {e}. Using analytical fallback.")
-        return _analytical_fallback(db, eligible_vendors, item_id, quant_evidence)
+        return _analytical_fallback(db, eligible_vendors, item_id, quant_evidence, quantity)
 
     # --- Step 5: Anti-hallucination validation ---
     validated_recs = _validate_llm_output(llm_output, eligible_vendor_ids)
     if not validated_recs:
         logger.warning("[VendorRAG] LLM output contained no valid vendor IDs after validation. Using fallback.")
-        return _analytical_fallback(db, eligible_vendors, item_id, quant_evidence)
+        return _analytical_fallback(db, eligible_vendors, item_id, quant_evidence, quantity)
+
 
     # --- Step 6: Build final RAGVendorRecommendation objects ---
     results = []

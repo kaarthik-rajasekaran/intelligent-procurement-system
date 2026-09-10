@@ -88,14 +88,23 @@ def get_vendor_recommendations(db: Session, item_id: uuid.UUID) -> List[VendorRe
         confidence = "HIGH" if (perf and item_perf) else ("MEDIUM" if perf else "LOW")
 
         explanation_parts = []
-        if quality >= 88:
-            explanation_parts.append(f"Outstanding quality rating ({round(quality, 1)}%)")
-        if delivery >= 88:
-            explanation_parts.append(f"Exceptional delivery punctuality ({round(delivery, 1)}%)")
-        if price >= 88:
-            explanation_parts.append(f"Highly competitive pricing ({round(price, 1)}%)")
+        if quality >= 90:
+            explanation_parts.append(f"Top-tier quality rating ({round(quality, 1)}%)")
+        elif quality >= 85:
+            explanation_parts.append(f"Strong quality compliance ({round(quality, 1)}%)")
+
+        if delivery >= 90:
+            explanation_parts.append(f"Superior on-time delivery ({round(delivery, 1)}%)")
+        elif delivery >= 85:
+            explanation_parts.append(f"Reliable fulfillment punctuality ({round(delivery, 1)}%)")
+
+        if price >= 90:
+            explanation_parts.append(f"High price competitiveness ({round(price, 1)}%)")
+        elif price <= 75:
+            explanation_parts.append(f"Premium commercial tier ({round(price, 1)}% price index)")
+
         if not explanation_parts:
-            explanation_parts.append(f"Balanced performance across categories (Score: {round(overall_score, 1)})")
+            explanation_parts.append(f"Consistent operational performance (Composite: {round(overall_score, 1)}/100)")
 
         scored_vendors.append({
             "vendor_id": vendor.id,
@@ -108,9 +117,10 @@ def get_vendor_recommendations(db: Session, item_id: uuid.UUID) -> List[VendorRe
             "fulfillment": round(fulfillment, 1),
             "responsiveness": round(responsiveness, 1),
             "badges": badges,
-            "explanation": " • ".join(explanation_parts),
+            "explanation": " | ".join(explanation_parts),
             "confidence": confidence
         })
+
 
     # Sort with deterministic tie-breaking: overall_score DESC, delivery DESC, quality DESC, vendor_name ASC
     scored_vendors.sort(

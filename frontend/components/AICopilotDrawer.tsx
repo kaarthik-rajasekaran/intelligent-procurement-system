@@ -42,7 +42,7 @@ export const AICopilotDrawer: React.FC<AICopilotDrawerProps> = ({
 
   const handleSend = async (customText?: string) => {
     const textToSend = customText || query;
-    if (!textToSend.trim()) return;
+    if (isLoading || !textToSend.trim()) return;
 
     const currentTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const newMsgs = [...messages, { sender: 'user' as const, text: textToSend, time: currentTime }];

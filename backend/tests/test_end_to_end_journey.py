@@ -21,7 +21,7 @@ def test_full_procurement_journey_e2e():
 
     vendors_res = client.get("/vendors", headers=emp_headers)
     assert vendors_res.status_code == 200
-    target_vendor = vendors_res.json()[0]
+    target_vendor = next((v for v in vendors_res.json() if "Apex" in v["name"]), vendors_res.json()[0])
 
     # 3. Create Structured Purchase Request (Qty 5)
     create_res = client.post(

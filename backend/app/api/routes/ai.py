@@ -74,7 +74,6 @@ def build_copilot_context(db: Session, message: str, context_type: str = None, c
                 )
 
     # 3. Always include a concise snapshot of all Recent Purchase Orders in the system
-    #    so general questions ("what orders exist?", "who is the supplier for order X?") are always answered accurately!
     recent_pos = db.query(PurchaseOrder).order_by(PurchaseOrder.generated_at.desc()).limit(15).all()
     if recent_pos:
         po_lines = []
@@ -88,7 +87,39 @@ def build_copilot_context(db: Session, message: str, context_type: str = None, c
             )
         context_sections.append("[ACTIVE ENTERPRISE PURCHASE ORDERS ON RECORD]\n" + "\n".join(po_lines))
 
-    # 4. Check for Policy / Guideline / Threshold queries
+    # 4. Check for Active Purchase Requests query
+    if any(w in message.lower() for w in ['request', 'requests', 'pr', 'active', 'status', 'queue']):
+        recent_prs = db.query(PurchaseRequest).order_by(PurchaseRequest.created_at.desc()).limit(10).all()
+        if recent_prs:
+            pr_lines = []
+            for pr in recent_prs:
+                it = pr.items[0] if pr.items else None
+                it_name = it.item.name if (it and it.item) else "Item"
+                qty = it.quantity if it else 1
+                v_name = pr.selected_vendor.name if pr.selected_vendor else "None"
+                pr_lines.append(
+                    f"• {pr.reference_number} | Status: {pr.status} | Requester: {pr.requester.name if pr.requester else 'Unknown'} | Item: {qty}x {it_name} | Supplier: {v_name}"
+                )
+            context_sections.append("[ACTIVE PURCHASE REQUESTS ON RECORD]\n" + "\n".join(pr_lines))
+
+    # 5. Check for Vendors / Suppliers query
+    if any(w in message.lower() for w in ['vendor', 'supplier', 'who', 'hardware', 'laptop', 'network', 'telecom', 'furniture', 'office', 'toner', 'safeguard']):
+        vendors = db.query(Vendor).filter(Vendor.is_active == True).all()
+        if vendors:
+            v_lines = [f"• {v.name} ({v.email}) | Badges: {', '.join([b.badge_type for b in v.badges]) if v.badges else 'Standard Partner'}" for v in vendors]
+            context_sections.append("[REGISTERED ENTERPRISE SUPPLIERS]\n" + "\n".join(v_lines))
+
+    # 6. Check for Multi-Factor Quotation Scoring query
+    if any(w in message.lower() for w in ['quotation', 'evaluation', 'score', 'scoring', 'multi-factor', 'weight', 'criteria']):
+        context_sections.append(
+            "[MULTI-FACTOR QUOTATION EVALUATION FORMULA]\n"
+            "• Price Competitiveness (40% weight): (Min Price / Quoted Price) * 100\n"
+            "• Delivery Lead Time (20% weight): Normalized based on delivery speed\n"
+            "• Vendor Historical Reliability (20% weight): Historical fulfillment and compliance record\n"
+            "• Product Quality (20% weight): Past QA inspection compliance and low return rate"
+        )
+
+    # 7. Check for Policy / Guideline / Threshold queries
     policy_keywords = ['policy', 'threshold', 'approval', 'guideline', 'limit', 'rules', 'compliance', 'supervisor']
     if any(k in message.lower() for k in policy_keywords):
         try:

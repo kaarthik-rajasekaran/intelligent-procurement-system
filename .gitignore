@@ -42,9 +42,11 @@ htmlcov/
 
 # Databases & local storage
 *.sqlite3
+*.db
 procurement.db
 backend/procurement.db
 storage/purchase_orders/*.pdf
+backend/storage/purchase_orders/*.pdf
 
 # Office temporary lock files
 ~$*.pptx
