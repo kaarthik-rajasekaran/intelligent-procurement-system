@@ -48,10 +48,12 @@ backend/procurement.db
 storage/purchase_orders/*.pdf
 backend/storage/purchase_orders/*.pdf
 
-# Office temporary lock files
+# Office temporary lock files & presentations
 ~$*.pptx
 ~$*.docx
 ~$*.xlsx
+*.pptx
+*.ppt
 
 # Environment variables & local configs
 .env
