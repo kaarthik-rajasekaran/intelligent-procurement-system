@@ -65,3 +65,9 @@ backend/storage/purchase_orders/*.pdf
 Thumbs.db
 ehthumbs.db
 desktop.ini
+
+# Local system docs & screenshots
+FINAL_SYSTEM_DOCUMENTATION.md
+INTELLIGENT_PROCUREMENT_AGENT_BUILD_BLUEPRINT.md
+PRESENTATION_DECK_GUIDE.md
+Problem_Statement_Screenshots/
